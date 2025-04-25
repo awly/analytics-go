@@ -12,8 +12,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/tidwall/gjson"
 )
 
 // Version of the client.
@@ -299,14 +297,22 @@ func (c *client) sendAsync(msgs []message, wg *sync.WaitGroup, ex *executor) {
 	}
 }
 
+type batchRequest struct {
+	UserID      string `json:"userId"`
+	AnonymousID string `json:"anonymousId"`
+}
+
 // Split based on Anonymous ID
 func (c *client) getNodePayload(msgs []message) map[int][]message {
 	nodePayload := make(map[int][]message)
 	totalNodes := c.totalNodes
 	for _, msg := range msgs {
-		userId := gjson.GetBytes(msg.json, "userId").String()
-		anonymousId := gjson.GetBytes(msg.json, "anonymousId").String()
-		rudderId := userId + ":" + anonymousId
+		var req batchRequest
+		if err := json.Unmarshal(msg.json, &req); err != nil {
+			c.errorf("failed to parse message payload: %v", err)
+			continue
+		}
+		rudderId := req.UserID + ":" + req.AnonymousID
 		hashInt := crc32.ChecksumIEEE([]byte(rudderId))
 		nodePayload[int(hashInt)%totalNodes] = append(nodePayload[int(hashInt)%totalNodes], msg)
 	}
@@ -328,14 +334,20 @@ func (c *client) getRevisedMsgs(nodePayload map[int][]message, startFrom int) []
 	return msgs
 }
 
+type clusterInfoResponse struct {
+	NodeCount int `json:"nodeCount"`
+}
+
 func (c *client) setNodeCount() {
 	const attempts = 10
 	for i := 0; i < attempts; i++ {
+		if i != 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
 		url := c.Endpoint + "/cluster-info"
 		req, err := http.NewRequest("GET", url, bytes.NewReader([]byte{}))
 		if err != nil {
 			c.errorf("creating request - %s", err)
-			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 
@@ -345,22 +357,24 @@ func (c *client) setNodeCount() {
 		res, err := c.http.Do(req)
 		if err != nil {
 			c.errorf("sending request - %s", err)
-			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		if res.StatusCode == 200 {
-			body, err := io.ReadAll(res.Body)
-			if err == nil {
-				c.totalNodes = int(gjson.GetBytes(body, "nodeCount").Int())
-				res.Body.Close()
-				return
-			} else {
-				res.Body.Close()
-				time.Sleep(200 * time.Millisecond)
-			}
-		} else {
-			time.Sleep(200 * time.Millisecond)
+		if res.StatusCode != 200 {
+			continue
 		}
+		body, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			c.errorf("failed to read cluster-info response: %v", err)
+			continue
+		}
+		var ci clusterInfoResponse
+		if err := json.Unmarshal(body, &ci); err != nil {
+			c.errorf("failed to parse cluster-info response: %v", err)
+			continue
+		}
+		c.totalNodes = ci.NodeCount
+		return
 	}
 }
 
